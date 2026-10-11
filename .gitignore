@@ -1,0 +1,5 @@
+.DS_Store
+app/.build/
+app/build/
+# Third-party ffmpeg/ffprobe binaries for the CLI: large, and not ours to redistribute.
+cli/bin/

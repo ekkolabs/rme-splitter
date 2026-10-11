@@ -1,0 +1,343 @@
+#!/bin/bash
+#
+# rme-split - RME TotalMix Recording Splitter
+# Splits multichannel WAV files from RME interfaces into separate mono/stereo tracks
+# Uses fast single-pass extraction (reads once, writes all outputs in parallel)
+#
+# Version: 2.0.0
+# License: MIT
+
+VERSION="2.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/rme-split.conf"
+CONFIG_NAME="default"
+
+# Prefer bundled static binaries (bin/), fall back to whatever is on PATH.
+# This lets rme-split run on a machine that has no ffmpeg installed.
+if [ -x "$SCRIPT_DIR/bin/ffmpeg" ]; then FFMPEG="$SCRIPT_DIR/bin/ffmpeg"; else FFMPEG="ffmpeg"; fi
+if [ -x "$SCRIPT_DIR/bin/ffprobe" ]; then FFPROBE="$SCRIPT_DIR/bin/ffprobe"; else FFPROBE="ffprobe"; fi
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+show_help() {
+    cat << EOF
+${GREEN}rme-split${NC} - RME TotalMix Recording Splitter v${VERSION}
+
+${YELLOW}USAGE:${NC}
+    rme-split split <input.wav> <output_dir>
+    rme-split scan <volume_path>
+    rme-split batch <volume_path> <output_dir>
+    rme-split info <wav_file>
+
+${YELLOW}COMMANDS:${NC}
+    split   Split a recording (auto-detects multi-part files)
+    scan    Scan a volume for RME recordings
+    batch   Process all recordings on a volume
+    info    Show information about a WAV file
+
+${YELLOW}OPTIONS:${NC}
+    -q, --quiet           Suppress progress output
+    -v, --verbose         Show detailed ffmpeg output
+    --config <name>       Use rme-split-<name>.conf (default: rme-split.conf)
+    --version             Show version information
+
+${YELLOW}EXAMPLES:${NC}
+    # Split a recording (auto-finds all parts)
+    rme-split split /Volumes/NO\\ NAME/UFX04_00.WAV ./REC04
+
+    # Scan SD card for recordings
+    rme-split scan /Volumes/NO\\ NAME
+
+    # Process all recordings on a volume
+    rme-split batch /Volumes/NO\\ NAME ./output
+
+    # Use PSP channel layout
+    rme-split --config psp split /Volumes/RME/UFX08_00.WAV ./output
+
+${YELLOW}NOTES:${NC}
+    - For multi-part recordings (FAT32), just specify the first file (_00.WAV)
+    - All other parts (_01.WAV, _02.WAV, etc.) are detected automatically
+    - Uses fast single-pass extraction (~90x realtime)
+
+EOF
+}
+
+show_version() { echo "rme-split version ${VERSION}"; }
+error() { echo -e "${RED}Error:${NC} $1" >&2; exit 1; }
+info() { [ -z "$QUIET" ] && echo -e "${BLUE}>>>${NC} $1"; }
+success() { [ -z "$QUIET" ] && echo -e "${GREEN}✓${NC} $1"; }
+warning() { echo -e "${YELLOW}Warning:${NC} $1" >&2; }
+
+check_deps() {
+    command -v "$FFMPEG" &>/dev/null || error "ffmpeg not found (bundled bin/ffmpeg missing and none on PATH). Install with: brew install ffmpeg"
+    command -v "$FFPROBE" &>/dev/null || error "ffprobe not found (bundled bin/ffprobe missing and none on PATH). Install with: brew install ffmpeg"
+}
+
+get_channels() { "$FFPROBE" -v quiet -show_entries stream=channels -of csv=p=0 "$1" 2>/dev/null; }
+get_duration() { "$FFPROBE" -v quiet -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null; }
+get_sample_rate() { "$FFPROBE" -v quiet -show_entries stream=sample_rate -of csv=p=0 "$1" 2>/dev/null; }
+get_bit_depth() { "$FFPROBE" -v quiet -show_entries stream=bits_per_sample -of csv=p=0 "$1" 2>/dev/null; }
+
+# Find all parts of a multi-part recording
+find_all_parts() {
+    local first_file="$1"
+    local dir=$(dirname "$first_file")
+    local base=$(basename "$first_file")
+
+    # Extract recording number (UFXnn from UFXnn_pp.WAV)
+    local rec_num=$(echo "$base" | sed 's/UFX\([0-9]*\)_.*/\1/')
+
+    # Find all parts
+    find "$dir" -maxdepth 1 -name "UFX${rec_num}_*.WAV" -type f 2>/dev/null | sort
+}
+
+# Build filter and map args from rme-split.conf
+build_from_config() {
+    local output_dir="$1"
+    [ ! -f "$CONFIG_FILE" ] && error "Config file not found: $CONFIG_FILE"
+
+    SPLIT_FILTER=""
+    SPLIT_MAP_ARGS=()
+    SPLIT_MAX_CH=0
+    local idx=1
+
+    while read -r channels name; do
+        if [[ "$channels" == *-* ]]; then
+            local c0="${channels%-*}" c1="${channels#*-}"
+            [ -n "$SPLIT_FILTER" ] && SPLIT_FILTER="$SPLIT_FILTER;"
+            SPLIT_FILTER="${SPLIT_FILTER}[0:a]pan=stereo|c0=c${c0}|c1=c${c1}[a${idx}]"
+            SPLIT_MAP_ARGS+=(-map "[a${idx}]" -c:a pcm_s24le "$output_dir/${name}.wav")
+            [ "$c1" -gt "$SPLIT_MAX_CH" ] && SPLIT_MAX_CH=$c1
+        else
+            [ -n "$SPLIT_FILTER" ] && SPLIT_FILTER="$SPLIT_FILTER;"
+            SPLIT_FILTER="${SPLIT_FILTER}[0:a]pan=mono|c0=c${channels}[a${idx}]"
+            SPLIT_MAP_ARGS+=(-map "[a${idx}]" -c:a pcm_s24le "$output_dir/${name}.wav")
+            [ "$channels" -gt "$SPLIT_MAX_CH" ] && SPLIT_MAX_CH=$channels
+        fi
+        idx=$((idx + 1))
+    done < <(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep -v '^[[:space:]]*$')
+}
+
+# Fast single-pass split (channel layout read from rme-split.conf)
+split_fast() {
+    local output_dir="$1"
+    local channel_count="$2"
+    local concat_file="$3"  # Empty if single file
+    local input_file="$4"   # Used if no concat file
+
+    build_from_config "$output_dir"
+    local min_ch=$((SPLIT_MAX_CH + 1))
+    [ "$channel_count" -lt "$min_ch" ] && error "Expected at least ${min_ch} channels, found $channel_count"
+
+    if [ -n "$concat_file" ]; then
+        "$FFMPEG" -y -loglevel error -stats -f concat -safe 0 -i "$concat_file" \
+            -filter_complex "$SPLIT_FILTER" "${SPLIT_MAP_ARGS[@]}"
+    else
+        "$FFMPEG" -y -loglevel error -stats -i "$input_file" \
+            -filter_complex "$SPLIT_FILTER" "${SPLIT_MAP_ARGS[@]}"
+    fi
+}
+
+cmd_split() {
+    local input="$1"
+    local output_dir="$2"
+
+    [ -z "$input" ] || [ -z "$output_dir" ] && error "Usage: rme-split split <input.wav> <output_dir>"
+    [ ! -f "$input" ] && error "File not found: $input"
+
+    # Find all parts
+    local all_parts=$(find_all_parts "$input")
+    local num_parts=$(echo "$all_parts" | wc -l | tr -d ' ')
+    local first_file=$(echo "$all_parts" | head -1)
+
+    # Check for empty file
+    local file_size=$(stat -f%z "$first_file" 2>/dev/null || stat --format=%s "$first_file" 2>/dev/null || echo 0)
+    [ "$file_size" -eq 0 ] && error "File is empty: $first_file"
+
+    local channel_count=$(get_channels "$first_file")
+
+    info "Input: $input"
+    [ "$num_parts" -gt 1 ] && info "Multi-part recording: $num_parts parts detected"
+    info "Channels: $channel_count"
+    info "Config: $CONFIG_NAME ($CONFIG_FILE)"
+    info "Output: $output_dir"
+
+    mkdir -p "$output_dir"
+
+    echo ""
+    echo -e "${GREEN}Extracting all channels (single-pass)...${NC}"
+
+    if [ "$num_parts" -gt 1 ]; then
+        # Create temp concat file
+        local concat_file=$(mktemp)
+        while IFS= read -r f; do
+            echo "file '$f'" >> "$concat_file"
+        done <<< "$all_parts"
+
+        split_fast "$output_dir" "$channel_count" "$concat_file" ""
+        rm -f "$concat_file"
+    else
+        split_fast "$output_dir" "$channel_count" "" "$input"
+    fi
+
+    echo ""
+    success "Done! Files saved to: $output_dir"
+}
+
+cmd_scan() {
+    local volume="$1"
+    [ ! -d "$volume" ] && error "Volume not found: $volume"
+
+    echo -e "${GREEN}Scanning for RME recordings on:${NC} $volume"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local rec_nums=$(find "$volume" -maxdepth 1 -name "UFX*.WAV" -type f 2>/dev/null | \
+        sed 's/.*UFX\([0-9]*\)_.*/\1/' | sort -u)
+
+    [ -z "$rec_nums" ] && { echo "No RME recordings found."; return; }
+
+    echo ""
+    printf "%-8s %-8s %-12s %-10s %s\n" "REC#" "PARTS" "CHANNELS" "DURATION" "SIZE"
+    echo "──────── ──────── ──────────── ────────── ─────────"
+
+    local total_recs=0
+    for rec_num in $rec_nums; do
+        local files=$(find "$volume" -maxdepth 1 -name "UFX${rec_num}_*.WAV" -type f 2>/dev/null | sort)
+        local num_parts=$(echo "$files" | wc -l | tr -d ' ')
+        local first_file=$(echo "$files" | head -1)
+
+        [ -z "$first_file" ] || [ ! -f "$first_file" ] && continue
+
+        local channels=$(get_channels "$first_file")
+        local total_dur=0 total_size=0
+
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            local dur=$(get_duration "$f")
+            [ -n "$dur" ] && total_dur=$(echo "$total_dur + $dur" | bc 2>/dev/null || echo "$total_dur")
+            local sz=$(stat -f%z "$f" 2>/dev/null || stat --format=%s "$f" 2>/dev/null || echo 0)
+            total_size=$((total_size + sz))
+        done <<< "$files"
+
+        local mins=$(echo "$total_dur / 60" | bc 2>/dev/null || echo "0")
+        local secs=$(echo "$total_dur - ($mins * 60)" | bc 2>/dev/null | xargs printf "%.0f" 2>/dev/null || echo "0")
+
+        local size_str
+        if [ $total_size -gt 1073741824 ]; then
+            size_str=$(echo "scale=1; $total_size / 1073741824" | bc 2>/dev/null)"GB"
+        elif [ $total_size -gt 1048576 ]; then
+            size_str=$(echo "scale=1; $total_size / 1048576" | bc 2>/dev/null)"MB"
+        else
+            size_str="${total_size}B"
+        fi
+
+        printf "%-8s %-8s %-12s %-10s %s\n" "REC${rec_num}" "${num_parts}" "${channels}ch" "${mins}m${secs}s" "$size_str"
+        total_recs=$((total_recs + 1))
+    done
+
+    echo ""
+    echo "Total recordings found: $total_recs"
+}
+
+cmd_batch() {
+    local volume="$1"
+    local output_base="$2"
+
+    [ -z "$volume" ] || [ -z "$output_base" ] && error "Usage: rme-split batch <volume_path> <output_dir>"
+    [ ! -d "$volume" ] && error "Volume not found: $volume"
+
+    info "Batch processing: $volume -> $output_base"
+    mkdir -p "$output_base"
+
+    local rec_nums=$(find "$volume" -maxdepth 1 -name "UFX*.WAV" -type f 2>/dev/null | \
+        sed 's/.*UFX\([0-9]*\)_.*/\1/' | sort -u)
+
+    [ -z "$rec_nums" ] && error "No RME recordings found on $volume"
+
+    for rec_num in $rec_nums; do
+        local first_file=$(find "$volume" -maxdepth 1 -name "UFX${rec_num}_00.WAV" -type f 2>/dev/null | head -1)
+        [ -z "$first_file" ] && first_file=$(find "$volume" -maxdepth 1 -name "UFX${rec_num}_*.WAV" -type f 2>/dev/null | sort | head -1)
+
+        local file_size=$(stat -f%z "$first_file" 2>/dev/null || stat --format=%s "$first_file" 2>/dev/null || echo 0)
+        if [ "$file_size" -eq 0 ]; then
+            warning "Skipping REC${rec_num} - empty file"
+            continue
+        fi
+
+        echo ""
+        echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        cmd_split "$first_file" "${output_base}/REC${rec_num}"
+    done
+
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    success "Batch processing complete!"
+}
+
+cmd_info() {
+    local file="$1"
+    [ ! -f "$file" ] && error "File not found: $file"
+
+    local all_parts=$(find_all_parts "$file")
+    local num_parts=$(echo "$all_parts" | wc -l | tr -d ' ')
+
+    echo -e "${GREEN}File Information:${NC} $file"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Channels:    $(get_channels "$file")"
+    echo "Sample Rate: $(get_sample_rate "$file") Hz"
+    echo "Bit Depth:   $(get_bit_depth "$file") bit"
+
+    if [ "$num_parts" -gt 1 ]; then
+        echo "Parts:       $num_parts"
+        local total_dur=0
+        while IFS= read -r f; do
+            local dur=$(get_duration "$f")
+            [ -n "$dur" ] && total_dur=$(echo "$total_dur + $dur" | bc 2>/dev/null)
+        done <<< "$all_parts"
+        local mins=$(echo "$total_dur / 60" | bc)
+        local secs=$(echo "$total_dur - ($mins * 60)" | bc | xargs printf "%.1f")
+        echo "Duration:    ${mins}m ${secs}s (total)"
+    else
+        local dur=$(get_duration "$file")
+        local mins=$(echo "$dur / 60" | bc)
+        local secs=$(echo "$dur - ($mins * 60)" | bc | xargs printf "%.1f")
+        echo "Duration:    ${mins}m ${secs}s"
+    fi
+    echo "Size:        $(ls -lh "$file" | awk '{print $5}')"
+}
+
+# Main
+main() {
+    check_deps
+    QUIET="" VERBOSE=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -q|--quiet) QUIET=1; shift ;;
+            -v|--verbose) VERBOSE=1; shift ;;
+            --config) CONFIG_NAME="$2"; CONFIG_FILE="$SCRIPT_DIR/rme-split-${2}.conf"; shift 2 ;;
+            --version) show_version; exit 0 ;;
+            -h|--help|help) show_help; exit 0 ;;
+            *) break ;;
+        esac
+    done
+
+    local cmd="${1:-help}"
+    shift || true
+
+    case $cmd in
+        split) cmd_split "$1" "$2" ;;
+        scan) cmd_scan "$1" ;;
+        batch) cmd_batch "$1" "$2" ;;
+        info) cmd_info "$1" ;;
+        help|--help|-h) show_help ;;
+        *) error "Unknown command: $cmd. Use 'rme-split help' for usage." ;;
+    esac
+}
+
+main "$@"
