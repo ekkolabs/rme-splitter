@@ -13,12 +13,21 @@ Both produce the same audio: the app's test suite runs the CLI on a sample recor
 
 ## The app
 
-### Requirements
+### Install
 
-- macOS 15 or later
-- Xcode or the Xcode command line tools, to build it
+Requires macOS 15 or later, on Apple silicon or Intel.
 
-### Build and run
+1. Download `RME-Splitter-<version>.dmg` from the [latest release](https://github.com/ekkolabs/rme-splitter/releases/latest).
+2. Open it and drag **RME Splitter** onto the **Applications** shortcut.
+3. The app is not notarised by Apple, so the first launch is blocked. Open it once, dismiss the warning, then go to **System Settings > Privacy & Security** and click **Open Anyway**. Alternatively, run:
+
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/RME Splitter.app"
+   ```
+
+### Build from source
+
+Needs Xcode or the Xcode command line tools.
 
 ```sh
 cd app
@@ -26,7 +35,7 @@ cd app
 open "build/RME Splitter.app"
 ```
 
-The build is signed ad hoc for the machine it was built on. There is no notarised download, so build it on the Mac you intend to use it on.
+`./package.sh` builds the universal app and the release disk image, `build/RME-Splitter-<version>.dmg`.
 
 To run the tests:
 
@@ -113,6 +122,7 @@ app/
   Resources/Templates/    .conf layouts bundled as starter templates
   Resources/AppIcon.icns  app icon, drawn by Scripts/make-icon.swift
   build.sh                builds build/RME Splitter.app
+  package.sh              builds the universal app and the .dmg installer
 ```
 
 ## The CLI
