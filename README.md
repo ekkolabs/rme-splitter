@@ -2,6 +2,8 @@
 
 Splits multichannel WAV recordings from RME interfaces (DURec on a UFX and similar) into separate, named mono and stereo tracks.
 
+Written for [MXGPU](https://www.mxgpu.net), the immersive 360° live show by Moullinex and GPU Panic, to turn the multitrack recording of every show into named stems the next morning. More in [From one recording to named stems](https://www.mxgpu.net/blog/rme-splitter).
+
 There are two versions in this repository:
 
 - **`app/`**: a native macOS app with drag and drop, waveforms, audio preview, trimming and editable naming templates. It has no dependencies.
