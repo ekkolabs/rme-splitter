@@ -37,7 +37,7 @@ cd app
 open "build/RME Splitter.app"
 ```
 
-`./package.sh` builds the universal app and the release disk image, `build/RME-Splitter-<version>.dmg`.
+`./package.sh` builds the universal app and the release disk image, `build/RME-Splitter-<version>.dmg`; `./package-pkg.sh` builds an installer package that puts the app in /Applications, `build/RME-Splitter-<version>.pkg`.
 
 To run the tests:
 
@@ -125,6 +125,7 @@ app/
   Resources/AppIcon.icns  app icon, drawn by Scripts/make-icon.swift
   build.sh                builds build/RME Splitter.app
   package.sh              builds the universal app and the .dmg installer
+  package-pkg.sh          builds the universal app and the .pkg installer
 ```
 
 ## The CLI
